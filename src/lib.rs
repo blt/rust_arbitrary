@@ -23,12 +23,29 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod buffers;
+pub use crate::buffers::*;
+
 /// Unstructured data from which structured `Arbitrary` data shall be generated.
 ///
 /// This could be a random number generator, a static ring buffer of bytes or some such.
 pub trait Unstructured {
     /// The error type for [`Unstructured`], see implementations for details
     type Error;
+
+    /// Reset the `Unstructured` instance to its default state.
+    ///
+    /// A call to `reset` allows the instance to be reused. This operation
+    /// always succeeds.
+    fn reset(&mut self) -> ();
+
+    /// Shift the initial offset of the `Unstructured` to the right.
+    ///
+    /// A call to `shift_right` modifies internal details of an instance to make
+    /// it appear that the initial buffer passed to `new` has been shifted right
+    /// by total bytes. This operation always succeeds.
+    fn shift_right(&mut self, total: usize) -> Result<(), Self::Error>;
+
     /// Fill a `buffer` with bytes, forming the unstructured data from which
     /// `Arbitrary` structured data shall be generated.
     ///
@@ -41,6 +58,12 @@ pub trait Unstructured {
     fn container_size(&mut self) -> Result<usize, Self::Error> {
         <u8 as Arbitrary>::arbitrary(self).map(|x| x as usize)
     }
+
+    /// Shrink the `Unstructured`
+    ///
+    /// This function returns the number of bytes now available in the
+    /// underlying pool.
+    fn shrink(&mut self) -> usize;
 }
 
 /// A trait to generate and shrink arbitrary types from an [`Unstructured`] pool
@@ -273,7 +296,7 @@ macro_rules! arbitrary_array {
     ($n: expr,) => {};
 }
 
-arbitrary_array!{ 32, T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T }
+arbitrary_array! { 32, T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T T }
 
 impl<A: Arbitrary> Arbitrary for Vec<A> {
     fn arbitrary<U: Unstructured + ?Sized>(u: &mut U) -> Result<Self, U::Error> {
@@ -453,150 +476,5 @@ impl<A: Arbitrary> Arbitrary for ::std::marker::PhantomData<A> {
 impl<A: Arbitrary> Arbitrary for ::std::num::Wrapping<A> {
     fn arbitrary<U: Unstructured + ?Sized>(u: &mut U) -> Result<Self, U::Error> {
         Arbitrary::arbitrary(u).map(::std::num::Wrapping)
-    }
-}
-
-/// An enumeration of buffer creation errors
-#[derive(Debug, Clone, Copy)]
-pub enum BufferError {
-    /// The input buffer is empty, causing construction of some buffer types to
-    /// fail
-    EmptyInput,
-}
-
-/// A source of unstructured data with a finite size
-///
-/// This buffer is a finite source of unstructured data. Once the data is
-/// exhausted it stays exhausted.
-pub struct FiniteBuffer<'a> {
-    buffer: &'a [u8],
-    offset: usize,
-    max_len: usize,
-}
-
-impl<'a> FiniteBuffer<'a> {
-    /// Create a new FiniteBuffer
-    ///
-    /// If the passed `buffer` is shorter than max_len the total number of bytes
-    /// will be the bytes available in `buffer`. If `buffer` is longer than
-    /// `max_len` the buffer will be trimmed.
-    pub fn new(buffer: &'a [u8], max_len: usize) -> Result<Self, BufferError> {
-        let buf: &'a [u8] = if buffer.len() > max_len {
-            &buffer[..max_len]
-        } else {
-            // This branch is hit if buffer is shorter than max_len. We might
-            // choose to make this an error condition instead of, potentially,
-            // surprising folks with less bytes.
-            buffer
-        };
-
-        Ok(FiniteBuffer {
-            buffer: buf,
-            offset: 0,
-            max_len: buf.len(),
-        })
-    }
-}
-
-impl<'a> Unstructured for FiniteBuffer<'a> {
-    type Error = ();
-
-    fn fill_buffer(&mut self, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        if (self.max_len - self.offset) >= buffer.len() {
-            let max = self.offset + buffer.len();
-            for (i, idx) in (self.offset..max).enumerate() {
-                buffer[i] = self.buffer[idx];
-            }
-            self.offset = max;
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    // NOTE(blt) I'm not sure if this is the right definition. I don't
-    // understand the purpose of container_size.
-    fn container_size(&mut self) -> Result<usize, Self::Error> {
-        <usize as Arbitrary>::arbitrary(self).map(|x| x % self.max_len)
-    }
-}
-
-/// A source of unstructured data which returns the same data over and over again
-///
-/// This buffer acts as a ring buffer over the source of unstructured data,
-/// allowing for an infinite amount of not-very-random data.
-pub struct RingBuffer<'a> {
-    buffer: &'a [u8],
-    offset: usize,
-    max_len: usize,
-}
-
-impl<'a> RingBuffer<'a> {
-    /// Create a new RingBuffer
-    pub fn new(buffer: &'a [u8], max_len: usize) -> Result<Self, BufferError> {
-        if buffer.is_empty() {
-            return Err(BufferError::EmptyInput);
-        }
-        Ok(RingBuffer {
-            buffer,
-            offset: 0,
-            max_len,
-        })
-    }
-}
-
-impl<'a> Unstructured for RingBuffer<'a> {
-    type Error = ();
-    fn fill_buffer(&mut self, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        let b = [&self.buffer[self.offset..], &self.buffer[..self.offset]];
-        let it = ::std::iter::repeat(&b[..]).flat_map(|x| x).flat_map(|&x| x);
-        self.offset = (self.offset + buffer.len()) % self.buffer.len();
-        for (d, f) in buffer.iter_mut().zip(it) {
-            *d = *f;
-        }
-        Ok(())
-    }
-
-    fn container_size(&mut self) -> Result<usize, Self::Error> {
-        <usize as Arbitrary>::arbitrary(self).map(|x| x % self.max_len)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn finite_buffer_fill_buffer() {
-        let x = [1, 2, 3, 4];
-        let mut rb = FiniteBuffer::new(&x, 10).unwrap();
-        let mut z = [0; 2];
-        rb.fill_buffer(&mut z).unwrap();
-        assert_eq!(z, [1, 2]);
-        rb.fill_buffer(&mut z).unwrap();
-        assert_eq!(z, [3, 4]);
-        assert!(rb.fill_buffer(&mut z).is_err());
-    }
-
-    #[test]
-    fn ring_buffer_fill_buffer() {
-        let x = [1, 2, 3, 4];
-        let mut rb = RingBuffer::new(&x, 2).unwrap();
-        let mut z = [0; 10];
-        rb.fill_buffer(&mut z).unwrap();
-        assert_eq!(z, [1, 2, 3, 4, 1, 2, 3, 4, 1, 2]);
-        rb.fill_buffer(&mut z).unwrap();
-        assert_eq!(z, [3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn ring_buffer_container_size() {
-        let x = [1, 2, 3, 4, 5];
-        let mut rb = RingBuffer::new(&x, 11).unwrap();
-        assert_eq!(rb.container_size().unwrap(), 9);
-        assert_eq!(rb.container_size().unwrap(), 1);
-        assert_eq!(rb.container_size().unwrap(), 2);
-        assert_eq!(rb.container_size().unwrap(), 6);
-        assert_eq!(rb.container_size().unwrap(), 1);
     }
 }
